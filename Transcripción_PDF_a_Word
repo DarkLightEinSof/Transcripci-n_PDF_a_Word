@@ -1,0 +1,340 @@
+# Transcripción PDF a Word:
+ 
+import fitz  # PyMuPDF (aún necesario para abrir el PDF original y detectar si es escaneado)
+from pdf2image import convert_from_path # Para PDFs escaneados
+from PIL import Image, ImageEnhance # Para OCR en imágenes
+import pytesseract # Para OCR
+import os # Para manejo de archivos y directorios
+import unicodedata # Para limpieza de texto
+import re # Para expresiones regulares
+from docx import Document # ¡La clave para Word!
+from docx.shared import Inches, Pt # Para unidades en Word
+from docx.enum.text import WD_ALIGN_PARAGRAPH # Para alinear texto en Word
+import pdfplumber # Para extraer tablas y texto con posición de PDFs digitales
+ 
+# --- Configuración de Tesseract ---
+# ¡IMPORTANTE! Asegúrate de que esta ruta sea correcta para tu instalación de Tesseract.
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\AdminTragsa\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+ 
+# --- Funciones de Utilidad ---
+def limpiar_texto(texto):
+    """Normaliza el texto, elimina acentos, lo convierte a minúsculas y limpia espacios."""
+    if not isinstance(texto, str):
+        return ""
+    texto = unicodedata.normalize('NFKD', texto).encode('ascii', 'ignore').decode('utf-8')
+    texto = texto.lower()
+    texto = re.sub(r'\s+', ' ', texto)  # Reemplaza múltiples espacios y saltos de línea por uno solo
+    return texto.strip()
+ 
+def normalizar_keywords(keywords):
+    """Normaliza una lista de palabras clave."""
+    return [limpiar_texto(k) for k in keywords]
+ 
+# --- Palabras clave y patrones para Detección de Actas ---
+INICIO_ACTA_PATTERNS = [
+    re.compile(r"acta\sde\s(?!')", re.IGNORECASE),
+    re.compile(r"acta\snumero\s", re.IGNORECASE),
+    re.compile(r"acta\sprèvia\s(?!')", re.IGNORECASE),
+    re.compile(r"acta\sprevia\s(?!')", re.IGNORECASE),
+    re.compile(r"acta\sd'ocupació\s(?!')", re.IGNORECASE),
+    re.compile(r"acta\sd'ocupacio\s(?!')", re.IGNORECASE)
+]
+ 
+FIN_KEYWORDS = [
+    "i, per que aixi consti", "el perit", "signatura", "i perque aixi consti", "per l'administracio",
+    "certifico", "doy fe", "en fe de lo cual", "se da por finalizado", "a los efectos",
+    "y firman", "final de la acta", "en prueba de conformidad", "la presente acta"
+]
+FIN_KEYWORDS_NORMALIZED = normalizar_keywords(FIN_KEYWORDS)
+ 
+# --- Detección de Tipo de PDF (Escaneado vs. Digital) ---
+def es_pdf_escaneado(doc):
+    """Determina si un PDF es escaneado (basado en imágenes) o digital (con texto seleccionable)."""
+    for i in range(min(5, len(doc))): # Revisa las primeras 5 páginas para eficiencia
+        page = doc.load_page(i)
+        text = page.get_text().strip()
+        if text:
+            return False # Se encontró texto seleccionable, no es escaneado
+    return True # No se encontró texto, asumimos escaneado
+ 
+# --- Extracción de Texto con OCR si es Necesario ---
+def extraer_texto_pagina(doc, page_number, escaneado, doc_path=None):
+    """Extrae texto de una página, usando OCR si el PDF es escaneado."""
+    if escaneado:
+        try:
+            # DPI alto para mejor precisión del OCR
+            images = convert_from_path(doc_path, first_page=page_number + 1, last_page=page_number + 1, dpi=300)
+            if not images:
+                print(f"[ADVERTENCIA] No se pudo convertir la página {page_number + 1} a imagen.")
+                return ""
+            image = images[0]
+            image = image.convert('L') # Escala de grises
+            text = pytesseract.image_to_string(image, lang='cat+spa') # OCR en catalán y español
+        except Exception as e:
+            print(f"[ERROR] OCR falló en página {page_number + 1} de {os.path.basename(doc_path)}: {e}")
+            text = ""
+    else:
+        # Para PDFs digitales, obtenemos el texto directamente de PyMuPDF (fitz)
+        text = doc.load_page(page_number).get_text()
+ 
+    return limpiar_texto(text)
+ 
+# --- Extracción del Tipo de Acta para el Nombre del Archivo ---
+def obtener_tipo_acta_del_texto(texto_acta_limpio):
+    """
+    Intenta extraer el tipo de acta del texto para usarlo en el nombre del archivo.
+    """
+    patrones_tipo = [
+        re.compile(r"acta\sde\s(?!l')(.+?)(?:\sde\sfecha|\sde\s[0-9]{1,2}|y\sfecha|\n|$)", re.IGNORECASE),
+        re.compile(r"acta\snumero\s\d+\s-\s(.+?)(?:\n|$)", re.IGNORECASE),
+        re.compile(r"acta\s(?:previa|prèvia|d'ocupacio|d'ocupació)\s(.+?)(?:\n|$)", re.IGNORECASE),
+        re.compile(r"acta\s(?!l')(.+?)(?:\n|$)", re.IGNORECASE)
+    ]
+ 
+    for patron in patrones_tipo:
+        match = patron.search(texto_acta_limpio)
+        if match:
+            tipo_bruto = match.group(1).strip()
+            tipo_final = re.sub(r'(\sde\sfecha|\sde\s\d{1,2}|\s\d{4}|\s\d+\s?-\s?\d+|\s\d+)$', '', tipo_bruto).strip()
+            if tipo_final in ["reunion", "sesion", "visita", "conciliacion", "ocupacion"]:
+                 return tipo_final
+            if len(tipo_final) > 60:
+                tipo_final = tipo_final[:60].rsplit(' ', 1)[0] + '...' if ' ' in tipo_final[:60] else tipo_final[:60]
+            tipo_final = re.sub(r'[^a-z0-9_]', '_', tipo_final)
+            tipo_final = re.sub(r'__+', '_', tipo_final).strip('_')
+            return tipo_final if tipo_final else "desconocido"
+    return "desconocido"
+ 
+# --- Función Principal de Detección de Actas ---
+def detectar_actas(doc, doc_path):
+    """
+    Detecta el rango de páginas de cada acta dentro de un documento PDF,
+    considerando el inicio de una nueva acta y las palabras clave de fin.
+    """
+    escaneado = es_pdf_escaneado(doc)
+   
+    actas_detectadas = []
+    current_acta_start_page = None
+    current_acta_title_text = ""
+    last_confirmed_end_page_of_current_acta = -1
+    
+    FIN_KEYWORD_SEARCH_RANGE = 8 # Rango de páginas adicionales para buscar FIN_KEYWORDS
+ 
+    for i in range(len(doc)):
+        texto_pagina = extraer_texto_pagina(doc, i, escaneado, doc_path)
+ 
+        es_inicio_nueva_acta = False
+        for pattern in INICIO_ACTA_PATTERNS:
+            if pattern.search(texto_pagina):
+                es_inicio_nueva_acta = True
+                break
+ 
+        if es_inicio_nueva_acta:
+            if current_acta_start_page is not None:
+                # Determina la página final de la acta anterior
+                end_page_for_prev_acta = min(i - 1, last_confirmed_end_page_of_current_acta)
+                if end_page_for_prev_acta < current_acta_start_page:
+                    end_page_for_prev_acta = i - 1
+ 
+                actas_detectadas.append({
+                    'start_page': current_acta_start_page,
+                    'end_page': end_page_for_prev_acta,
+                    'title_text': current_acta_title_text
+                })
+                print(f"  Acta Finalizada: Páginas {current_acta_start_page+1}-{end_page_for_prev_acta+1}. Tipo: '{obtener_tipo_acta_del_texto(current_acta_title_text)}'")
+ 
+            current_acta_start_page = i
+            current_acta_title_text = texto_pagina
+            last_confirmed_end_page_of_current_acta = -1
+            print(f"  Inicio de nueva acta detectado en la página {i+1}.")
+       
+        # Si estamos dentro de un acta, buscamos las palabras clave de fin
+        if current_acta_start_page is not None:
+            search_end_page = min(len(doc) - 1, i + FIN_KEYWORD_SEARCH_RANGE)
+            for j in range(i, search_end_page + 1):
+                temp_texto_pagina = extraer_texto_pagina(doc, j, escaneado, doc_path) if j != i else texto_pagina
+                
+                if any(k in temp_texto_pagina for k in FIN_KEYWORDS_NORMALIZED):
+                    last_confirmed_end_page_of_current_acta = j
+   
+    # Al final del documento, procesar la última acta si existe
+    if current_acta_start_page is not None:
+        end_page_for_last_acta = min(len(doc) - 1, last_confirmed_end_page_of_current_acta)
+        if end_page_for_last_acta < current_acta_start_page: # Si no se encontró un fin explícito
+             end_page_for_last_acta = len(doc) - 1 # Se extiende hasta el final del documento
+ 
+        actas_detectadas.append({
+            'start_page': current_acta_start_page,
+            'end_page': end_page_for_last_acta,
+            'title_text': current_acta_title_text
+        })
+        print(f"  Acta Finalizada (última del documento): Páginas {current_acta_start_page+1}-{end_page_for_last_acta+1}. Tipo: '{obtener_tipo_acta_del_texto(current_acta_title_text)}'")
+ 
+    return actas_detectadas
+ 
+# --- Función para guardar Acta en Formato Word (.docx) ---
+def guardar_acta_en_word(doc_original_path, acta_info, output_word_path, escaneado):
+    """
+    Extrae el contenido de una acta específica (texto y tablas) y lo guarda en un documento Word,
+    intentando replicar la estructura del PDF original.
+    """
+    document = Document()
+   
+    # Título principal del documento Word
+    main_heading = document.add_heading(f"Acta: {obtener_tipo_acta_del_texto(acta_info['title_text'])}", level=1)
+    main_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    document.add_paragraph(f"Páginas originales: {acta_info['start_page']+1} - {acta_info['end_page']+1}")
+   document.add_paragraph("\n" + "="*80 + "\n") # Separador visual
+ 
+    try:
+        with pdfplumber.open(doc_original_path) as pdf:
+            for page_num in range(acta_info['start_page'], acta_info['end_page'] + 1):
+                if page_num >= len(pdf.pages): # Asegurarse de que la página existe
+                    print(f"[ADVERTENCIA] Página {page_num+1} fuera de rango en pdfplumber para {os.path.basename(doc_original_path)}. Saltando.")
+                    continue
+ 
+                page = pdf.pages[page_num]
+                document.add_heading(f"Página {page_num+1} del documento original", level=2)
+                document.add_paragraph("\n")
+ 
+                # --- 1. Extraer y añadir texto ---
+                if not escaneado: # Para PDFs digitales: usar pdfplumber para mejor estructura
+                    page_text_blocks = page.extract_text(x_tolerance=2, y_tolerance=2, layout=True)
+                    if page_text_blocks:
+                        for line in page_text_blocks.split('\n'):
+                            if line.strip(): # Añade cada línea como un párrafo
+                                document.add_paragraph(line.strip())
+                else: # Para PDFs escaneados: usar OCR con Tesseract
+                    # Abrimos el documento con fitz para pasárselo a extraer_texto_pagina
+                    temp_doc_fitz = fitz.open(doc_original_path)
+                    ocr_text = extraer_texto_pagina(temp_doc_fitz, page_num, escaneado, doc_original_path)
+                    temp_doc_fitz.close() # Cerrar el doc temporal
+                    for paragraph_text in ocr_text.split('\n\n'): # Divide por doble salto de línea para párrafos
+                        if paragraph_text.strip():
+                            document.add_paragraph(paragraph_text.strip())
+ 
+                # --- 2. Extraer y añadir tablas ---
+                # La extracción de tablas de PDFs escaneados es muy compleja y no la manejamos aquí.
+                if not escaneado:
+                    tables = page.extract_tables()
+                    if tables:
+                        document.add_heading(f"Tablas detectadas en la página {page_num+1}", level=3)
+                        for table_data in tables:
+                            # Filtra filas vacías y asegura número de columnas consistente
+                            filtered_table_data = [row for row in table_data if any(cell is not None and str(cell).strip() for cell in row)]
+                            if filtered_table_data:
+                                rows = len(filtered_table_data)
+                                # Determina el número máximo de columnas en la tabla detectada
+                                cols = max(len(r) for r in filtered_table_data) if filtered_table_data else 0
+ 
+                                if rows > 0 and cols > 0: # Solo si la tabla tiene contenido
+                                    table = document.add_table(rows=rows, cols=cols)
+                                    table.style = 'Table Grid' # Estilo básico con bordes
+                                    for r_idx, row_data in enumerate(filtered_table_data):
+                                        # Asegura que haya suficientes celdas para cada fila
+                                        for c_idx in range(cols):
+                                            cell = table.rows[r_idx].cells[c_idx]
+                                            cell_text = str(row_data[c_idx] if c_idx < len(row_data) and row_data[c_idx] is not None else "")
+                                            cell.text = cell_text
+                                else:
+                                    document.add_paragraph("Tabla detectada pero vacía o con formato irregular.")
+                                document.add_paragraph("\n") # Espacio después de las tablas
+               
+                document.add_paragraph("\n" + "-"*50 + "\n") # Separador entre páginas
+               
+    except Exception as e:
+        print(f"Error al procesar el contenido de PDF para Word para el acta '{obtener_tipo_acta_del_texto(acta_info['title_text'])}' (Páginas {acta_info['start_page']+1}-{acta_info['end_page']+1}): {e}")
+        # En caso de error, al menos volcar el texto básico
+        document.add_paragraph("--- Error al extraer contenido estructurado. Texto plano a continuación: ---")
+        doc_fitz_fallback = fitz.open(doc_original_path)
+        for page_num in range(acta_info['start_page'], acta_info['end_page'] + 1):
+            basic_text = extraer_texto_pagina(doc_fitz_fallback, page_num, escaneado, doc_original_path)
+            document.add_paragraph(basic_text)
+        doc_fitz_fallback.close()
+ 
+    try:
+        document.save(output_word_path)
+        print(f"✅ Acta Word guardada: {os.path.basename(output_word_path)}")
+    except Exception as e:
+        print(f"❌ Error al guardar el documento Word {os.path.basename(output_word_path)}: {e}")
+ 
+ 
+# --- Función Principal de Procesamiento ---
+def procesar_actas_a_word(doc_path, salida_dir_words="actas_separadas_word"):
+    """
+    Abre un PDF, detecta las actas individuales, extrae sus títulos
+    y guarda cada acta en un nuevo documento Word.
+    """
+    os.makedirs(salida_dir_words, exist_ok=True)
+    doc_fitz = fitz.open(doc_path)
+    escaneado = es_pdf_escaneado(doc_fitz) # Determinar si el documento original es escaneado
+ 
+    print(f"\nProcesando el documento original: '{os.path.basename(doc_path)}' (Escaneado: {escaneado})")
+ 
+    actas_info = detectar_actas(doc_fitz, doc_path)
+ 
+    if not actas_info:
+        print(f"No se detectaron actas en '{os.path.basename(doc_path)}'.")
+        doc_fitz.close()
+        return []
+ 
+    processed_words_paths = []
+ 
+    for idx, acta in enumerate(actas_info):
+        titulo_acta_detectado = obtener_tipo_acta_del_texto(acta['title_text'])
+ 
+        # --- Nombre de archivo para Word ---
+        nombre_base = f"Acta_{titulo_acta_detectado}"
+        nombre_word_final = f"{nombre_base}_{idx+1}.docx"
+        contador_word = 1
+        while os.path.exists(os.path.join(salida_dir_words, nombre_word_final)):
+            nombre_word_final = f"{nombre_base}_{idx+1}_{contador_word}.docx"
+            contador_word += 1
+        ruta_word_salida = os.path.join(salida_dir_words, nombre_word_final)
+ 
+        # --- Guardar como Word ---
+        try:
+            guardar_acta_en_word(doc_path, acta, ruta_word_salida, escaneado)
+            processed_words_paths.append(ruta_word_salida)
+        except Exception as e:
+            print(f"❌ Error general al crear/guardar Word para acta '{nombre_word_final}': {e}")
+ 
+    doc_fitz.close() # Cerrar el documento original de fitz
+    return processed_words_paths
+ 
+# --- Punto de Entrada del Script ---
+if __name__ == "__main__":
+    # --- CONFIGURACIÓN DE RUTAS ---
+    CARPETA_ORIGEN_PDFS = r"C:\Users\AdminTragsa\Desktop\Tasques i dades personals\Analisi_de_dades\Python\Pruebas\PDF_Actas.2025"
+    CARPETA_DESTINO_ACTAS_WORD = r"C:\Users\AdminTragsa\Desktop\Tasques i dades personals\Analisi_de_dades\Python\Pruebas\ActasSeparadas_Output_Words"
+ 
+    if not os.path.isdir(CARPETA_ORIGEN_PDFS):
+        print(f"Error: La carpeta de origen '{CARPETA_ORIGEN_PDFS}' no existe.")
+    else:
+        print(f"Iniciando procesamiento de PDFs desde: '{CARPETA_ORIGEN_PDFS}'")
+        print(f"Las actas en formato Word se guardarán en: '{CARPETA_DESTINO_ACTAS_WORD}'")
+        print("---")
+ 
+        total_pdfs_originales_procesados = 0
+        total_actas_word_generadas = 0
+ 
+        for archivo in os.listdir(CARPETA_ORIGEN_PDFS):
+            if archivo.lower().endswith('.pdf'):
+                ruta_pdf_original = os.path.join(CARPETA_ORIGEN_PDFS, archivo)
+                try:
+                    rutas_words = procesar_actas_a_word(
+                        ruta_pdf_original,
+                        CARPETA_DESTINO_ACTAS_WORD
+                    )
+                    total_pdfs_originales_procesados += 1
+                    total_actas_word_generadas += len(rutas_words)
+                except Exception as e:
+                    print(f"Error general al procesar el archivo '{archivo}': {e}")
+                print("\n" + "="*80 + "\n")
+ 
+        print(f"\nResumen del procesamiento:")
+        print(f"Documentos PDF originales procesados: {total_pdfs_originales_procesados}")
+        print(f"Total de actas Word individuales generadas: {total_actas_word_generadas}")
+        print("Proceso completado.")
+ 
+ 
